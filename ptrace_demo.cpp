@@ -401,11 +401,6 @@ int main(int argc, char **argv) {
   // the tracer's control.
   ptrace_options |= PTRACE_O_EXITKILL;
 
-  // Send a SIGKILL signal to the tracee if the tracer exits.  This option is
-  // useful for ptrace jailers that want to ensure that tracees can never escape
-  // the tracer's control.
-  ptrace_options |= PTRACE_O_EXITKILL;
-
   //
   // set those options
   //

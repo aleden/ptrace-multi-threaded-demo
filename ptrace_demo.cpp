@@ -1,18 +1,14 @@
-#include <array>
-#include <unordered_map>
+#include <asm/unistd.h>
 #include <cassert>
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <sys/ptrace.h>
 #include <sys/reg.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
-#include <thread>
 #include <unistd.h>
-#include <asm/unistd.h>
 
 using namespace std;
 

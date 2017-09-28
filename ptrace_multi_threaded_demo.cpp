@@ -10,6 +10,10 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <array>
+#include <thread>
+#include <mutex>
+#include <sys/syscall.h>
 
 using namespace std;
 
@@ -21,6 +25,7 @@ enum SYSCALL_STATE {
   SYSCALL_EXITED
 };
 static unordered_map<pid_t, int> chld_thd_sysc_state;
+static unordered_map<pid_t, int> chld_thd_sysc_no;
 
 int main(int argc, char **argv) {
   fprintf(stderr, "parent: forking...\n");
@@ -162,19 +167,19 @@ int main(int argc, char **argv) {
       int no;
 
 #if defined(__i386__)
-      no = ptrace(PTRACE_PEEKUSER, child,
+      no = ptrace(PTRACE_PEEKUSER, p,
                   __builtin_offsetof(struct user, regs.orig_eax));
 #elif defined(__x86_64__)
-      no = ptrace(PTRACE_PEEKUSER, child,
+      no = ptrace(PTRACE_PEEKUSER, p,
                   __builtin_offsetof(struct user, regs.orig_rax));
 #elif defined(__arm__)
-      no = ptrace(PTRACE_PEEKUSER, child,
+      no = ptrace(PTRACE_PEEKUSER, p,
                   __builtin_offsetof(struct user, regs.uregs[7]));
 #else
 #error "unknown architecture"
 #endif
 
-      fprintf(stderr, "parent: SYSCALL [%s]", name_of_syscall_number(no));
+      chld_thd_sysc_no[p] = no;
       break;
     }
 
@@ -185,19 +190,21 @@ int main(int argc, char **argv) {
       int res;
 
 #if defined(__i386__)
-      res = ptrace(PTRACE_PEEKUSER, child,
+      res = ptrace(PTRACE_PEEKUSER, p,
                    __builtin_offsetof(struct user, regs.eax));
 #elif defined(__x86_64__)
-      res = ptrace(PTRACE_PEEKUSER, child,
+      res = ptrace(PTRACE_PEEKUSER, p,
                    __builtin_offsetof(struct user, regs.rax));
 #elif defined(__arm__)
-      res = ptrace(PTRACE_PEEKUSER, child,
+      res = ptrace(PTRACE_PEEKUSER, p,
                    __builtin_offsetof(struct user, regs.uregs[0]));
 #else
 #error "unknown architecture"
 #endif
 
-      fprintf(stderr, " = %d\n", res);
+      int no = chld_thd_sysc_no[p];
+      fprintf(stderr, "parent: [%d] SYSCALL [%s] = %d\n", p,
+              name_of_syscall_number(no), res);
       fflush(stderr);
       break;
     }
@@ -210,6 +217,23 @@ int main(int argc, char **argv) {
   }
 
   return 0;
+}
+
+static mutex mtx;
+static void do_thread(int n) {
+  for (int i = 1;; ++i) {
+    {
+      lock_guard<mutex> lck(mtx);
+      fprintf(stdout, "child: %d [%d]\n", i,
+              static_cast<int>(syscall(SYS_gettid)));
+      fflush(stdout);
+    }
+
+    struct timespec tm;
+    clock_gettime(CLOCK_MONOTONIC, &tm);
+    tm.tv_sec += 3;
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &tm, NULL);
+  }
 }
 
 int do_child(int argc, char **argv) {
@@ -232,15 +256,14 @@ int do_child(int argc, char **argv) {
   // signal-delivery-stop.
   //
 
-  for (int i = 1;; ++i) {
-    fprintf(stdout, "child: %d\n", i);
-    fflush(stdout);
+  constexpr unsigned NUM_THREADS = 3;
 
-    struct timespec tm;
-    clock_gettime(CLOCK_MONOTONIC, &tm);
-    tm.tv_sec += 3;
-    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &tm, NULL);
-  }
+  array<thread, NUM_THREADS> thds;
+  for (unsigned i = 0; i < NUM_THREADS; i++)
+    thds[i] = thread(do_thread, i+1);
+
+  for (thread& thd : thds)
+    thd.join();
 
   return 0;
 }

@@ -1,20 +1,20 @@
-# ptrace-demo
+# ptrace-multi-threaded-demo
 Simple commented program which demonstrates using ptrace(2)
 
 ## Usage
 ```bash
-cd ptrace-demo
+cd ptrace-multi-threaded-demo
 make
-./ptrace-demo 1> stdout 2> stderr
+./ptrace-multi-threaded-demo 1> stdout 2> stderr
 ```
 In another terminal, do
 ```bash
-cd ptrace-demo
+cd ptrace-multi-threaded-demo
 tail --follow stdout
 ```
-to follow output from the child and
+to follow output from the children and
 ```bash
-cd ptrace-demo
+cd ptrace-multi-threaded-demo
 tail --follow stderr
 ```
 to follow output from the parent. You should see output like the following:

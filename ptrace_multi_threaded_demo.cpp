@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include <asm/unistd.h>
 #include <cassert>
 #include <cstdio>
@@ -15,11 +16,17 @@ using namespace std;
 static const char* name_of_syscall_number(int);
 static int do_child(int argc, char **argv);
 
+enum SYSCALL_STATE {
+  SYSCALL_ENTERED,
+  SYSCALL_EXITED
+};
+static unordered_map<pid_t, int> chld_thd_sysc_state;
+
 int main(int argc, char **argv) {
   fprintf(stderr, "parent: forking...\n");
   fflush(stderr);
 
-  pid_t child = fork();
+  const pid_t child = fork();
   if (!child)
     return do_child(argc, argv);
 
@@ -63,6 +70,21 @@ int main(int argc, char **argv) {
   // the tracer's control.
   ptrace_options |= PTRACE_O_EXITKILL;
 
+  // Stop the tracee at the next clone(2) and automatically start tracing the
+  // newly cloned process, which will start with a SIGSTOP, or PTRACE_EVENT_STOP
+  // if PTRACE_SEIZE was used.  A waitpid(2) by the tracer will return a status
+  // value such that
+  //
+  //  status>>8 == (SIGTRAP | (PTRACE_EVENT_CLONE<<8))
+  //
+  // The PID of the new process can be retrieved with PTRACE_GETEVENTMSG. This
+  // option may not catch clone(2) calls in all cases.  If the tracee calls
+  // clone(2) with the CLONE_VFORK flag, PTRACE_EVENT_VFORK will be delivered
+  // instead if PTRACE_O_TRACEVFORK is set; otherwise if the tracee calls
+  // clone(2) with the exit signal set to SIGCHLD, PTRACE_EVENT_FORK will be
+  // delivered if PTRACE_O_TRACEFORK is set.
+  ptrace_options |= PTRACE_O_TRACECLONE;
+
   //
   // set those options
   //
@@ -72,8 +94,8 @@ int main(int argc, char **argv) {
   fprintf(stderr, "ptrace options set!\n");
   fflush(stderr);
 
-  auto wait_for_syscall = [&](void) -> void {
-    do {
+  auto wait_for_syscall_entry_or_exit = [](pid_t p) -> pid_t {
+    for (;;) {
       // Restart the stopped tracee as for PTRACE_CONT, but arrange for the
       // tracee to be stopped at the next entry to or exit from a system call.
       // (The tracee will also, as usual, be stopped upon receipt of a
@@ -88,7 +110,7 @@ int main(int argc, char **argv) {
       // the tracee; otherwise, no signal is delivered.  Thus, for example, the
       // tracer can control whether a signal sent to the tracee is delivered or
       // not.
-      ptrace(PTRACE_SYSCALL, child, 0, 0);
+      ptrace(PTRACE_SYSCALL, p, 0, 0);
 
       //
       // Syscall-enter-stop and syscall-exit-stop are observed by the tracer
@@ -97,18 +119,43 @@ int main(int argc, char **argv) {
       // was set by the tracer, then WSTOPSIG(status) will give the value
       // (SIGTRAP | 0x80).
       //
-      waitpid(-1, &status, __WALL);
-    } while (!(WIFSTOPPED(status) && WSTOPSIG(status) == (SIGTRAP | 0x80)));
+      int status;
+      pid_t child_waited = waitpid(-1, &status, __WALL);
+      if (child_waited == -1) /* no children left */
+        exit(0);
+
+      if (WIFSTOPPED(status)) {
+        if (WSTOPSIG(status) == (SIGTRAP | 0x80)) /* syscall */
+          return child_waited;
+
+        pid_t new_child;
+        if (WSTOPSIG(status) == SIGTRAP &&
+            status >> 8 == (SIGTRAP | (PTRACE_EVENT_CLONE << 8)) &&
+            ptrace(PTRACE_GETEVENTMSG, child_waited, 0, &new_child) != -1) {
+          //
+          // thread creation in child
+          //
+          fprintf(stderr, "parent: thread %d created...\n", new_child);
+          fflush(stderr);
+
+          ptrace(PTRACE_SYSCALL, new_child, 0, 0);
+        }
+      }
+
+      p = child_waited;
+    }
   };
-  auto wait_for_syscall_entry = wait_for_syscall;
-  auto wait_for_syscall_exit = wait_for_syscall;
 
   //
   // Main loop of the parent
   //
+  pid_t p = child; /* handle initial signal-delivery-stop */
   for (;;) {
-    wait_for_syscall_entry();
-    {
+    p = wait_for_syscall_entry_or_exit(p);
+    int &sysc_state = chld_thd_sysc_state[p];
+
+    switch (sysc_state) {
+    case SYSCALL_ENTERED: {
       //
       // getting the syscall number
       //
@@ -128,10 +175,10 @@ int main(int argc, char **argv) {
 #endif
 
       fprintf(stderr, "parent: SYSCALL [%s]", name_of_syscall_number(no));
+      break;
     }
 
-    wait_for_syscall_exit();
-    {
+    case SYSCALL_EXITED: {
       //
       // getting the syscall return value
       //
@@ -152,8 +199,16 @@ int main(int argc, char **argv) {
 
       fprintf(stderr, " = %d\n", res);
       fflush(stderr);
+      break;
     }
+
+    default:
+      assert(false);
+    }
+
+    sysc_state ^= 1; /* toggle state */
   }
+
   return 0;
 }
 

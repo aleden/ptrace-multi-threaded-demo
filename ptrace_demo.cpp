@@ -15,6 +15,152 @@
 
 using namespace std;
 
+static const char* name_of_syscall_number(int);
+static int do_child(int argc, char **argv);
+
+int main(int argc, char **argv) {
+  fprintf(stderr, "parent: forking...\n");
+  fflush(stderr);
+
+  pid_t child = fork();
+  if (!child)
+    return do_child(argc, argv);
+
+  //
+  // parent
+  //
+
+  //
+  // Normally when a (possibly multithreaded) process receives any signal except
+  // SIGKILL, the kernel selects an arbitrary thread which handles the signal.
+  // (If the signal is generated with tgkill(2), the target thread can be
+  // explicitly selected by the caller.)
+  //
+  // However, if the selected thread is traced, it enters signal-delivery-stop.
+  //
+  // At this point, the signal is not yet delivered to the process, and can be
+  // suppressed by the tracer. If the tracer doesn't suppress the signal, it
+  // passes the signal to the tracee in the next ptrace restart request.
+  //
+
+  //
+  // observe the (initial) signal-delivery-stop
+  //
+  int status;
+  waitpid(child, &status, 0);
+  assert(WIFSTOPPED(status));
+
+  //
+  // select ptrace options
+  //
+  int ptrace_options = 0;
+
+  // When delivering system call traps, set bit 7 in the signal number (i.e.,
+  // deliver SIGTRAP|0x80). This makes it easy for the tracer to distinguish
+  // normal traps from those caused by a system call. Note:
+  // PTRACE_O_TRACESYSGOOD may not work on all architectures.
+  ptrace_options |= PTRACE_O_TRACESYSGOOD;
+
+  // Send a SIGKILL signal to the tracee if the tracer exits. This option is
+  // useful for ptrace jailers that want to ensure that tracees can never escape
+  // the tracer's control.
+  ptrace_options |= PTRACE_O_EXITKILL;
+
+  //
+  // set those options
+  //
+  fprintf(stderr, "parent: setting ptrace options...\n");
+  fflush(stderr);
+  ptrace(PTRACE_SETOPTIONS, child, 0, ptrace_options);
+  fprintf(stderr, "ptrace options set!\n");
+  fflush(stderr);
+
+  auto wait_for_syscall = [&](void) -> void {
+    do {
+      // Restart the stopped tracee as for PTRACE_CONT, but arrange for the
+      // tracee to be stopped at the next entry to or exit from a system call.
+      // (The tracee will also, as usual, be stopped upon receipt of a
+      // signal.) From the tracer's perspective, the tracee will appear to
+      // have been stopped by receipt of a SIGTRAP. So, for PTRACE_SYSCALL,
+      // the idea is to inspect the arguments to the system call at the first
+      // stop, then do another PTRACE_SYSCALL and inspect the return value of
+      // the system call at the second stop.
+      //
+      // The data argument is treated as for PTRACE_CONT; i.e. If data is
+      // nonzero, it is interpreted as the number of a signal to be delivered to
+      // the tracee; otherwise, no signal is delivered.  Thus, for example, the
+      // tracer can control whether a signal sent to the tracee is delivered or
+      // not.
+      ptrace(PTRACE_SYSCALL, child, 0, 0);
+
+      //
+      // Syscall-enter-stop and syscall-exit-stop are observed by the tracer
+      // as waitpid(2) returning with WIFSTOPPED(status) true, and
+      // WSTOPSIG(status) giving SIGTRAP. If the PTRACE_O_TRACESYSGOOD option
+      // was set by the tracer, then WSTOPSIG(status) will give the value
+      // (SIGTRAP | 0x80).
+      //
+      waitpid(-1, &status, __WALL);
+    } while (!(WIFSTOPPED(status) && WSTOPSIG(status) == (SIGTRAP | 0x80)));
+  };
+  auto wait_for_syscall_entry = wait_for_syscall;
+  auto wait_for_syscall_exit = wait_for_syscall;
+
+  //
+  // Main loop of the parent
+  //
+  for (;;) {
+    wait_for_syscall_entry();
+    {
+      int no = ptrace(PTRACE_PEEKUSER, child,
+                      __builtin_offsetof(user_regs_struct, orig_rax));
+      fprintf(stderr, "parent: SYSCALL [%s]", name_of_syscall_number(no));
+    }
+
+    wait_for_syscall_exit();
+    {
+      int res = ptrace(PTRACE_PEEKUSER, child,
+                       __builtin_offsetof(user_regs_struct, rax));
+      fprintf(stderr, " = %d\n", res);
+      fflush(stderr);
+    }
+  }
+  return 0;
+}
+
+int do_child(int argc, char **argv) {
+  //
+  // child
+  //
+
+  //
+  // the request
+  //
+  ptrace(PTRACE_TRACEME);
+  //
+  // turns the calling thread into a tracee.  The thread continues to run
+  // (doesn't enter ptrace-stop).  A common practice is to follow the
+  // PTRACE_TRACEME with
+  //
+  raise(SIGSTOP);
+  //
+  // and allow the parent (which is our tracer now) to observe our
+  // signal-delivery-stop.
+  //
+
+  for (int i = 1;; ++i) {
+    fprintf(stdout, "child: %d\n", i);
+    fflush(stdout);
+
+    struct timespec tm;
+    clock_gettime(CLOCK_MONOTONIC, &tm);
+    tm.tv_sec += 3;
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &tm, NULL);
+  }
+
+  return 0;
+}
+
 static const unordered_map<int, const char *> sysc_no_nm_map = {
     {0, "read"},
     {1, "write"},
@@ -351,151 +497,10 @@ static const unordered_map<int, const char *> sysc_no_nm_map = {
     {332, "statx"},
 };
 
-static int do_child(int argc, char **argv);
+const char* name_of_syscall_number(int num) {
+  auto it = sysc_no_nm_map.find(num);
+  if (it == sysc_no_nm_map.end())
+    return "UNKNOWN";
 
-int main(int argc, char **argv) {
-  fprintf(stderr, "parent: forking...\n");
-  fflush(stderr);
-
-  pid_t child = fork();
-  if (!child)
-    return do_child(argc, argv);
-
-  //
-  // parent
-  //
-
-  //
-  // Normally when a (possibly multithreaded) process receives any signal except
-  // SIGKILL, the kernel selects an arbitrary thread which handles the signal.
-  // (If the signal is generated with tgkill(2), the target thread can be
-  // explicitly selected by the caller.)
-  //
-  // However, if the selected thread is traced, it enters signal-delivery-stop.
-  //
-  // At this point, the signal is not yet delivered to the process, and can be
-  // suppressed by the tracer. If the tracer doesn't suppress the signal, it
-  // passes the signal to the tracee in the next ptrace restart request.
-  //
-
-  //
-  // observe the (initial) signal-delivery-stop
-  //
-  int status;
-  waitpid(child, &status, 0);
-  assert(WIFSTOPPED(status));
-
-  //
-  // select ptrace options
-  //
-  int ptrace_options = 0;
-
-  // When delivering system call traps, set bit 7 in the signal number (i.e.,
-  // deliver SIGTRAP|0x80). This makes it easy for the tracer to distinguish
-  // normal traps from those caused by a system call. Note:
-  // PTRACE_O_TRACESYSGOOD may not work on all architectures.
-  ptrace_options |= PTRACE_O_TRACESYSGOOD;
-
-  // Send a SIGKILL signal to the tracee if the tracer exits. This option is
-  // useful for ptrace jailers that want to ensure that tracees can never escape
-  // the tracer's control.
-  ptrace_options |= PTRACE_O_EXITKILL;
-
-  //
-  // set those options
-  //
-  fprintf(stderr, "parent: setting ptrace options...\n");
-  fflush(stderr);
-  ptrace(PTRACE_SETOPTIONS, child, 0, ptrace_options);
-  fprintf(stderr, "ptrace options set!\n");
-  fflush(stderr);
-
-  auto wait_for_syscall = [&](void) -> void {
-    do {
-      // Restart the stopped tracee as for PTRACE_CONT, but arrange for the
-      // tracee to be stopped at the next entry to or exit from a system call.
-      // (The tracee will also, as usual, be stopped upon receipt of a
-      // signal.) From the tracer's perspective, the tracee will appear to
-      // have been stopped by receipt of a SIGTRAP. So, for PTRACE_SYSCALL,
-      // the idea is to inspect the arguments to the system call at the first
-      // stop, then do another PTRACE_SYSCALL and inspect the return value of
-      // the system call at the second stop.
-      //
-      // The data argument is treated as for PTRACE_CONT; i.e. If data is
-      // nonzero, it is interpreted as the number of a signal to be delivered to
-      // the tracee; otherwise, no signal is delivered.  Thus, for example, the
-      // tracer can control whether a signal sent to the tracee is delivered or
-      // not.
-      ptrace(PTRACE_SYSCALL, child, 0, 0);
-
-      //
-      // Syscall-enter-stop and syscall-exit-stop are observed by the tracer
-      // as waitpid(2) returning with WIFSTOPPED(status) true, and
-      // WSTOPSIG(status) giving SIGTRAP. If the PTRACE_O_TRACESYSGOOD option
-      // was set by the tracer, then WSTOPSIG(status) will give the value
-      // (SIGTRAP | 0x80).
-      //
-      waitpid(child, &status, 0);
-    } while (!(WIFSTOPPED(status) && WSTOPSIG(status) & 0x80));
-  };
-  auto wait_for_syscall_entry = wait_for_syscall;
-  auto wait_for_syscall_exit = wait_for_syscall;
-
-  //
-  // Main loop of the parent
-  //
-  for (;;) {
-    wait_for_syscall_entry();
-    {
-      int no = ptrace(PTRACE_PEEKUSER, child,
-                      __builtin_offsetof(user_regs_struct, orig_rax));
-      auto it = sysc_no_nm_map.find(no);
-      if (it == sysc_no_nm_map.end())
-        fprintf(stderr, "parent: SYSCALL [UNKNOWN] (%d)", no);
-      else
-        fprintf(stderr, "parent: SYSCALL [%s]", (*it).second);
-    }
-
-    wait_for_syscall_exit();
-    {
-      int res = ptrace(PTRACE_PEEKUSER, child,
-                       __builtin_offsetof(user_regs_struct, rax));
-      fprintf(stderr, " = %d\n", res);
-      fflush(stderr);
-    }
-  }
-  return 0;
-}
-
-int do_child(int argc, char **argv) {
-  //
-  // child
-  //
-
-  //
-  // the request
-  //
-  ptrace(PTRACE_TRACEME);
-  //
-  // turns the calling thread into a tracee.  The thread continues to run
-  // (doesn't enter ptrace-stop).  A common practice is to follow the
-  // PTRACE_TRACEME with
-  //
-  raise(SIGSTOP);
-  //
-  // and allow the parent (which is our tracer now) to observe our
-  // signal-delivery-stop.
-  //
-
-  for (int i = 1;; ++i) {
-    fprintf(stdout, "child: %d\n", i);
-    fflush(stdout);
-
-    struct timespec tm;
-    clock_gettime(CLOCK_MONOTONIC, &tm);
-    tm.tv_sec += 3;
-    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &tm, NULL);
-  }
-
-  return 0;
+  return (*it).second;
 }

@@ -14,22 +14,26 @@
 #include <thread>
 #include <mutex>
 #include <sys/syscall.h>
+#include <string.h>
 
 using namespace std;
 
-static const char* name_of_syscall_number(int);
 static int do_child(int argc, char **argv);
 
-enum SYSCALL_STATE {
-  SYSCALL_ENTERED,
-  SYSCALL_EXITED
+enum SYSCALL_STATE { SYSCALL_ENTERED, SYSCALL_EXITED };
+struct child_syscall_state_t {
+  SYSCALL_STATE st;
+  int no;
 };
-static unordered_map<pid_t, int> chld_thd_sysc_state;
-static unordered_map<pid_t, int> chld_thd_sysc_no;
+static void toggle_syscall_state(child_syscall_state_t& st) {
+  st.st = (st.st == SYSCALL_ENTERED ? SYSCALL_EXITED : SYSCALL_ENTERED);
+}
+static std::unordered_map<pid_t, child_syscall_state_t> chld_sysc_map;
+static const char* name_of_syscall_number(int);
+static const char* name_of_signal_number(int);
 
 int main(int argc, char **argv) {
   fprintf(stderr, "parent: forking...\n");
-  fflush(stderr);
 
   const pid_t child = fork();
   if (!child)
@@ -55,9 +59,12 @@ int main(int argc, char **argv) {
   //
   // observe the (initial) signal-delivery-stop
   //
+  fprintf(stderr, "parent: waiting for initial stop of child %d...\n", child);
   int status;
-  waitpid(child, &status, 0);
-  assert(WIFSTOPPED(status));
+  do
+    waitpid(child, &status, 0);
+  while (!WIFSTOPPED(status));
+  fprintf(stderr, "parent: initial stop observed\n");
 
   //
   // select ptrace options
@@ -94,72 +101,161 @@ int main(int argc, char **argv) {
   // set those options
   //
   fprintf(stderr, "parent: setting ptrace options...\n");
-  fflush(stderr);
   ptrace(PTRACE_SETOPTIONS, child, 0, ptrace_options);
   fprintf(stderr, "ptrace options set!\n");
-  fflush(stderr);
 
-  auto wait_for_syscall_entry_or_exit = [](pid_t p) -> pid_t {
+  auto wait_for_syscall_entry_or_exit = [](pid_t pid) -> pid_t {
+    siginfo_t si;
+    uintptr_t sig = 0;
+
     for (;;) {
-      // Restart the stopped tracee as for PTRACE_CONT, but arrange for the
-      // tracee to be stopped at the next entry to or exit from a system call.
-      // (The tracee will also, as usual, be stopped upon receipt of a
-      // signal.) From the tracer's perspective, the tracee will appear to
-      // have been stopped by receipt of a SIGTRAP. So, for PTRACE_SYSCALL,
-      // the idea is to inspect the arguments to the system call at the first
-      // stop, then do another PTRACE_SYSCALL and inspect the return value of
-      // the system call at the second stop.
-      //
-      // The data argument is treated as for PTRACE_CONT; i.e. If data is
-      // nonzero, it is interpreted as the number of a signal to be delivered to
-      // the tracee; otherwise, no signal is delivered.  Thus, for example, the
-      // tracer can control whether a signal sent to the tracee is delivered or
-      // not.
-      ptrace(PTRACE_SYSCALL, p, 0, 0);
-
-      //
-      // Syscall-enter-stop and syscall-exit-stop are observed by the tracer
-      // as waitpid(2) returning with WIFSTOPPED(status) true, and
-      // WSTOPSIG(status) giving SIGTRAP. If the PTRACE_O_TRACESYSGOOD option
-      // was set by the tracer, then WSTOPSIG(status) will give the value
-      // (SIGTRAP | 0x80).
-      //
-      int status;
-      pid_t child_waited = waitpid(-1, &status, __WALL);
-      if (child_waited == -1) /* no children left */
-        exit(0);
-
-      if (WIFSTOPPED(status)) {
-        if (WSTOPSIG(status) == (SIGTRAP | 0x80)) /* syscall */
-          return child_waited;
-
-        pid_t new_child;
-        if (WSTOPSIG(status) == SIGTRAP &&
-            status >> 8 == (SIGTRAP | (PTRACE_EVENT_CLONE << 8)) &&
-            ptrace(PTRACE_GETEVENTMSG, child_waited, 0, &new_child) != -1) {
-          //
-          // thread creation in child
-          //
-          fprintf(stderr, "parent: thread %d created...\n", new_child);
-          fflush(stderr);
-
-          ptrace(PTRACE_SYSCALL, new_child, 0, 0);
+      if (pid != -1) {
+        // Restart the stopped tracee as for PTRACE_CONT, but arrange for the
+        // tracee to be stopped at the next entry to or exit from a system call.
+        // (The tracee will also, as usual, be stopped upon receipt of a
+        // signal.) From the tracer's perspective, the tracee will appear to
+        // have been stopped by receipt of a SIGTRAP. So, for PTRACE_SYSCALL,
+        // the idea is to inspect the arguments to the system call at the first
+        // stop, then do another PTRACE_SYSCALL and inspect the return value of
+        // the system call at the second stop.
+        //
+        // The data argument is treated as for PTRACE_CONT; i.e. If data is
+        // nonzero, it is interpreted as the number of a signal to be delivered
+        // to the tracee; otherwise, no signal is delivered.  Thus, for example,
+        // the tracer can control whether a signal sent to the tracee is
+        // delivered or not.
+        if (ptrace(PTRACE_SYSCALL, pid, 0, (void *)sig) == -1) {
+          fprintf(stderr,
+                  "parent: failed to ptrace(PTRACE_SYSCALL): %s\n",
+                  strerror(errno));
+          return -1;
         }
       }
 
-      p = child_waited;
+      //
+      // reset restart signal and pid
+      //
+      sig = 0;
+      pid = -1;
+
+      //
+      // wait for a child process to stop or terminate
+      //
+      int status;
+      pid_t child_waited = waitpid(-1, &status, __WALL);
+      if (child_waited == -1) {
+        fprintf(stderr, "parent: waitpid(1) failed : %s\n",
+                strerror(errno));
+        return -1;
+      } else {
+        if (WIFSTOPPED(status)) {
+          //
+          // the following kinds of ptrace-stops exist:
+          //
+          //   (1) syscall-stops
+          //   (2) PTRACE_EVENT stops
+          //   (3) group-stops
+          //   (4) signal-delivery-stops
+          //
+          // they all are reported by waitpid(2) with WIFSTOPPED(status) true.
+          // They may be differentiated by examining the value status>>8, and if
+          // there is ambiguity in that value, by querying PTRACE_GETSIGINFO.
+          // (Note: the WSTOPSIG(status) macro can't be used to perform this
+          // examination, because it returns the value (status>>8) & 0xff.)
+          //
+          pid = child_waited;
+
+          const int stopsig = WSTOPSIG(status);
+          if (stopsig == (SIGTRAP | 0x80)) {
+            //
+            // (1) Syscall-enter-stop and syscall-exit-stop are observed by the
+            // tracer as waitpid(2) returning with WIFSTOPPED(status) true, and-
+            // if the PTRACE_O_TRACESYSGOOD option was set by the tracer- then
+            // WSTOPSIG(status) will give the value (SIGTRAP | 0x80).
+            //
+            return child_waited;
+          } else if (stopsig == SIGTRAP) {
+            //
+            // PTRACE_EVENT stops (2) are observed by the tracer as waitpid(2)
+            // returning with WIFSTOPPED(status), and WSTOPSIG(status) returns
+            // SIGTRAP.
+            //
+            const unsigned int event = (unsigned int)status >> 16;
+            switch (event) {
+            case PTRACE_EVENT_VFORK:
+              fprintf(stderr, "parent: ptrace event (PTRACE_EVENT_VFORK)\n");
+              break;
+            case PTRACE_EVENT_FORK:
+              fprintf(stderr, "parent: ptrace event (PTRACE_EVENT_FORK)\n");
+              break;
+            case PTRACE_EVENT_CLONE: {
+              pid_t new_child;
+              ptrace(PTRACE_GETEVENTMSG, child_waited, 0, &new_child);
+              fprintf(stderr,
+                      "parent: ptrace event (PTRACE_EVENT_CLONE) [%d]\n",
+                      new_child);
+              break;
+            }
+            case PTRACE_EVENT_VFORK_DONE:
+              fprintf(stderr, "parent: ptrace event (PTRACE_EVENT_VFORK_DONE)\n");
+              break;
+            case PTRACE_EVENT_EXEC:
+              fprintf(stderr, "parent: ptrace event (PTRACE_EVENT_EXEC)\n");
+              break;
+            case PTRACE_EVENT_EXIT:
+              fprintf(stderr, "parent: ptrace event (PTRACE_EVENT_EXIT)\n");
+              break;
+            case PTRACE_EVENT_STOP:
+              fprintf(stderr, "parent: ptrace event (PTRACE_EVENT_STOP)\n");
+              break;
+            case PTRACE_EVENT_SECCOMP:
+              fprintf(stderr, "parent: ptrace event (PTRACE_EVENT_SECCOMP)\n");
+              break;
+            default:
+              fprintf(stderr, "parent: unknown ptrace event %u\n", event);
+              break;
+            }
+          } else if (ptrace(PTRACE_GETSIGINFO, child_waited, 0, &si) < 0) {
+            //
+            // (3) group-stop
+            //
+            fprintf(stderr, "parent: group-stop [%s]\n",
+                    name_of_signal_number(stopsig));
+
+            // When restarting a tracee from a ptrace-stop other than
+            // signal-delivery-stop, recommended practice is to always pass 0 in
+            // sig.
+          } else {
+            //
+            // (4) signal-delivery-stop
+            //
+            fprintf(stderr, "parent: signal-delivery-stop [%s]\n",
+                    name_of_signal_number(stopsig));
+
+            // deliver it
+            sig = stopsig;
+          }
+        } else {
+          //
+          // the child process terminated
+          //
+          fprintf(stderr, "parent: child terminated\n");
+        }
+      }
     }
   };
 
   //
   // Main loop of the parent
   //
-  pid_t p = child; /* handle initial signal-delivery-stop */
+  pid_t pid = child; /* handle initial signal-delivery-stop */
   for (;;) {
-    p = wait_for_syscall_entry_or_exit(p);
-    int &sysc_state = chld_thd_sysc_state[p];
+    pid = wait_for_syscall_entry_or_exit(pid);
+    if (pid == -1)
+      break;
 
-    switch (sysc_state) {
+    child_syscall_state_t &st = chld_sysc_map[pid];
+    switch (st.st) {
     case SYSCALL_ENTERED: {
       //
       // getting the syscall number
@@ -167,19 +263,19 @@ int main(int argc, char **argv) {
       int no;
 
 #if defined(__i386__)
-      no = ptrace(PTRACE_PEEKUSER, p,
+      no = ptrace(PTRACE_PEEKUSER, pid,
                   __builtin_offsetof(struct user, regs.orig_eax));
 #elif defined(__x86_64__)
-      no = ptrace(PTRACE_PEEKUSER, p,
+      no = ptrace(PTRACE_PEEKUSER, pid,
                   __builtin_offsetof(struct user, regs.orig_rax));
 #elif defined(__arm__)
-      no = ptrace(PTRACE_PEEKUSER, p,
+      no = ptrace(PTRACE_PEEKUSER, pid,
                   __builtin_offsetof(struct user, regs.uregs[7]));
 #else
 #error "unknown architecture"
 #endif
 
-      chld_thd_sysc_no[p] = no;
+      st.no = no;
       break;
     }
 
@@ -190,30 +286,28 @@ int main(int argc, char **argv) {
       int res;
 
 #if defined(__i386__)
-      res = ptrace(PTRACE_PEEKUSER, p,
+      res = ptrace(PTRACE_PEEKUSER, pid,
                    __builtin_offsetof(struct user, regs.eax));
 #elif defined(__x86_64__)
-      res = ptrace(PTRACE_PEEKUSER, p,
+      res = ptrace(PTRACE_PEEKUSER, pid,
                    __builtin_offsetof(struct user, regs.rax));
 #elif defined(__arm__)
-      res = ptrace(PTRACE_PEEKUSER, p,
+      res = ptrace(PTRACE_PEEKUSER, pid,
                    __builtin_offsetof(struct user, regs.uregs[0]));
 #else
 #error "unknown architecture"
 #endif
 
-      int no = chld_thd_sysc_no[p];
-      fprintf(stderr, "parent: [%d] SYSCALL [%s] = %d\n", p,
-              name_of_syscall_number(no), res);
-      fflush(stderr);
+      fprintf(stderr, "parent: [%d] SYSCALL [%s] = %d\n", pid,
+              name_of_syscall_number(st.no), res);
       break;
     }
 
     default:
-      assert(false);
+      __builtin_unreachable();
     }
 
-    sysc_state ^= 1; /* toggle state */
+    toggle_syscall_state(st);
   }
 
   return 0;
@@ -226,7 +320,6 @@ static void do_thread(int n) {
       lock_guard<mutex> lck(mtx);
       fprintf(stdout, "child: %d [%d]\n", i,
               static_cast<int>(syscall(SYS_gettid)));
-      fflush(stdout);
     }
 
     struct timespec tm;
@@ -266,6 +359,107 @@ int do_child(int argc, char **argv) {
     thd.join();
 
   return 0;
+}
+
+const char *name_of_signal_number(int num) {
+  switch (num) {
+#define _CHECK_SIGNAL(NM)                                                      \
+  case NM:                                                                     \
+    return #NM;
+
+#ifdef SIGHUP
+  _CHECK_SIGNAL(SIGHUP)
+#endif
+#ifdef SIGINT
+  _CHECK_SIGNAL(SIGINT)
+#endif
+#ifdef SIGQUIT
+  _CHECK_SIGNAL(SIGQUIT)
+#endif
+#ifdef SIGILL
+  _CHECK_SIGNAL(SIGILL)
+#endif
+#ifdef SIGTRAP
+  _CHECK_SIGNAL(SIGTRAP)
+#endif
+#ifdef SIGABRT
+  _CHECK_SIGNAL(SIGABRT)
+#endif
+#ifdef SIGBUS
+  _CHECK_SIGNAL(SIGBUS)
+#endif
+#ifdef SIGFPE
+  _CHECK_SIGNAL(SIGFPE)
+#endif
+#ifdef SIGKILL
+  _CHECK_SIGNAL(SIGKILL)
+#endif
+#ifdef SIGUSR1
+  _CHECK_SIGNAL(SIGUSR1)
+#endif
+#ifdef SIGSEGV
+  _CHECK_SIGNAL(SIGSEGV)
+#endif
+#ifdef SIGUSR2
+  _CHECK_SIGNAL(SIGUSR2)
+#endif
+#ifdef SIGPIPE
+  _CHECK_SIGNAL(SIGPIPE)
+#endif
+#ifdef SIGALRM
+  _CHECK_SIGNAL(SIGALRM)
+#endif
+#ifdef SIGTERM
+  _CHECK_SIGNAL(SIGTERM)
+#endif
+#ifdef SIGSTKFLT
+  _CHECK_SIGNAL(SIGSTKFLT)
+#endif
+#ifdef SIGCHLD
+  _CHECK_SIGNAL(SIGCHLD)
+#endif
+#ifdef SIGCONT
+  _CHECK_SIGNAL(SIGCONT)
+#endif
+#ifdef SIGSTOP
+  _CHECK_SIGNAL(SIGSTOP)
+#endif
+#ifdef SIGTSTP
+  _CHECK_SIGNAL(SIGTSTP)
+#endif
+#ifdef SIGTTIN
+  _CHECK_SIGNAL(SIGTTIN)
+#endif
+#ifdef SIGTTOU
+  _CHECK_SIGNAL(SIGTTOU)
+#endif
+#ifdef SIGURG
+  _CHECK_SIGNAL(SIGURG)
+#endif
+#ifdef SIGXCPU
+  _CHECK_SIGNAL(SIGXCPU)
+#endif
+#ifdef SIGXFSZ
+  _CHECK_SIGNAL(SIGXFSZ)
+#endif
+#ifdef SIGVTALRM
+  _CHECK_SIGNAL(SIGVTALRM)
+#endif
+#ifdef SIGPROF
+  _CHECK_SIGNAL(SIGPROF)
+#endif
+#ifdef SIGWINCH
+  _CHECK_SIGNAL(SIGWINCH)
+#endif
+#ifdef SIGPOLL
+  _CHECK_SIGNAL(SIGPOLL)
+#endif
+#ifdef SIGSYS
+  _CHECK_SIGNAL(SIGSYS)
+#endif
+  }
+
+  return "UNKNOWN";
 }
 
 const char* name_of_syscall_number(int num) {
@@ -723,6 +917,9 @@ const char* name_of_syscall_number(int num) {
 #endif
 #ifdef __NR_ugetrlimit
   _CHECK_SYSCALL(ugetrlimit)
+#endif
+#ifdef __NR_mmap
+  _CHECK_SYSCALL(mmap)
 #endif
 #ifdef __NR_mmap2
   _CHECK_SYSCALL(mmap2)

@@ -1,6 +1,8 @@
 # ptrace-multi-threaded-demo
 Simple commented program which demonstrates using ptrace(2)
 
+This is no longer maintained; see ptracetricks: https://github.com/aleden/ptracetricks
+
 ## Usage
 ```bash
 cd ptrace-multi-threaded-demo
